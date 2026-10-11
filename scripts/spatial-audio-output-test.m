@@ -153,15 +153,16 @@ int main(void)
         CHECK(ao->device_buffer == 192000 * 3, "mpv may queue 3 s");
         CHECK(p->synchronizer.rate == 0, "the clock waits at rate 0");
 
-        // mpv cannot scale a bitstream, so its volume and mute go to the host.
+        // mpv cannot scale a bitstream, so its volume and mute go to the host
+        // as mpv sets them (ao_set_gain() calls the driver), paused or not.
         CHECK(s->volumes == 1 && s->volume == 1.0f, "open hands the host mpv's volume");
-        atomic_store(&ao->gain, 0.0f);
+        set_pause(ao, true);
+        audio_out_spatial.set_gain(ao, 0.0f);
+        CHECK(s->volumes == 2 && s->volume == 0.0f, "a change reaches the host at once, paused too, mute as 0");
         state_of(ao);
-        CHECK(s->volumes == 2 && s->volume == 0.0f, "a change reaches the host, mute as 0");
-        state_of(ao);
-        CHECK(s->volumes == 2, "an unchanged volume is not sent again");
-        atomic_store(&ao->gain, 1.0f);
-        state_of(ao);
+        CHECK(s->volumes == 2, "reading the state sends nothing more");
+        set_pause(ao, false);
+        audio_out_spatial.set_gain(ao, 1.0f);
 
         // Bursts reach the host unchanged, before and after start().
         write_burst(ao, 0x5a);
