@@ -5,7 +5,7 @@ on:
     inputs:
       version:
         description: 'Release tag name'
-        default: '0.41.0-av5-sab1'
+        default: '0.41.0-av5-sab2'
   pull_request:
     branches:
       - main
@@ -29,7 +29,7 @@ jobs:
         run: |
           VERSION="$INPUT_VERSION"
           if [ -z "$VERSION" ]; then
-            VERSION="0.41.0-av5-sab1"
+            VERSION="0.41.0-av5-sab2"
           fi
           echo "RELEASE_VERSION=$VERSION" >> "$GITHUB_ENV"
 
@@ -51,6 +51,14 @@ jobs:
 
       - name: Create combined MPVKit.xcframework
         run: ./Sources/BuildScripts/create-combined-framework.sh
+
+      # Without FFmpeg's spdif muxer, mpv's passthrough decoder fails on its
+      # first packet and the audio track dies, so the spatial output never opens.
+      - name: Check that passthrough is built
+        run: |
+          for lib in dist/MPVKit-combined/xcframework/MPVKit.xcframework/*/MPVKit.framework/MPVKit; do
+            nm "$lib" | grep -q ff_spdif_muxer || { echo "no spdif muxer in $lib"; exit 1; }
+          done
 
       - name: Upload binary to GitHub Release
         if: github.event_name != 'pull_request'
