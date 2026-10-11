@@ -19,6 +19,6 @@ printf '#pragma once\n#define HAVE_AVFOUNDATION 1\n' > "$WORK/config.h"
 xcrun --sdk macosx clang -x objective-c -std=c11 -Wall -Wno-unused-parameter \
     -I"$WORK" -I"$WORK/mpv" -I"$WORK/mpv/include" \
     "$ROOT/scripts/spatial-audio-output-test.m" \
-    -framework AVFoundation -framework CoreMedia -framework Foundation \
+    -framework AVFoundation -framework CoreMedia -framework Foundation -framework QuartzCore \
     -o "$WORK/spatial-audio-output-test"
 "$WORK/spatial-audio-output-test"

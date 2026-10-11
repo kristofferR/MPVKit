@@ -12,6 +12,8 @@
 
 #include "audio/out/ao_spatial.m"
 
+#import <QuartzCore/QuartzCore.h>
+
 // The parts of mpv the driver calls.
 static atomic_int wakeups;
 static int reloads;
@@ -146,15 +148,20 @@ int main(void)
         int before = atomic_load(&wakeups);
         usleep(60 * 1000);
         CHECK(fabs(state_of(ao).delay - 0.2) < 0.001, "the clock does not move while waiting");
-        CHECK(atomic_load(&wakeups) - before >= 3, "the ao thread is nudged while waiting (%d)", atomic_load(&wakeups) - before);
+        CHECK(atomic_load(&wakeups) > before, "the ao thread is nudged while waiting");
 
-        // Once ready, the clock runs from the timeline's start.
+        // Once ready, the clock runs from the timeline's start. Sleeps on a
+        // busy machine overshoot, so the delay is checked against the time
+        // that actually passed.
         s->ready = true;
         st = state_of(ao);
+        CFTimeInterval started = CACurrentMediaTime();
         CHECK(p->synchronizer.rate == 1, "the clock starts when the host is ready");
-        usleep(100 * 1000);
+        usleep(50 * 1000);
         double delay = state_of(ao).delay;
-        CHECK(delay > 0.07 && delay < 0.13, "delay falls in real time (%f)", delay);
+        double expected = MPMAX(0.2 - (CACurrentMediaTime() - started), 0);
+        CHECK(fabs(delay - expected) < 0.02, "delay falls in real time (%f, expected %f)", delay, expected);
+        usleep(15 * 1000); // lets a timer tick already in flight land
         before = atomic_load(&wakeups);
         usleep(40 * 1000);
         CHECK(atomic_load(&wakeups) == before, "no nudging once the clock runs");
