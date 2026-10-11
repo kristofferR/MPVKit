@@ -195,6 +195,8 @@ int main(void)
         write_burst(ao, 2);
         CHECK(s->begins == begins + 1, "a write after an underrun begins a new timeline");
         CHECK(!p->clock_running && p->synchronizer.rate == 0, "the new timeline waits for the host");
+        // mpv may not have seen the underrun, and then calls no start().
+        CHECK(p->playing && atomic_load(&p->waiting), "playback stays active across the new timeline");
         CHECK(fabs(state_of(ao).delay - 0.02) < 0.001, "only the new audio is queued");
 
         // A seek begins a new timeline at the current time and waits for the host again.
@@ -213,6 +215,12 @@ int main(void)
         CHECK(s->ends == 1, "the host hears the end");
         state_of(ao);
         CHECK(p->clock_running && p->synchronizer.rate == 1, "the clock starts once the host has flushed");
+        CHECK(state_of(ao).free_samples == 0, "the next file waits until this one has played out");
+        usleep(40 * 1000);
+        begins = s->begins;
+        write_burst(ao, 3);
+        CHECK(s->begins == begins + 1 && !p->ended, "the next file begins a new timeline");
+        CHECK(p->playing, "and keeps playing, as mpv sends no start() between gapless files");
 
         // A long run stays representable: 14 h at 192 kHz overflows written * 1e9.
         reset(ao);
