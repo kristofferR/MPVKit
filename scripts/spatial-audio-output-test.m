@@ -1,0 +1,201 @@
+// Unit test for the "spatial" audio output (patch 0007). It drives the driver
+// the way mpv's push thread does, against a real synchronizer and a fake host
+// sink. Run scripts/test-spatial-audio-output.sh, which builds it against a
+// patched mpv checkout.
+
+#include <math.h>
+#include <stdarg.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+
+#include "audio/out/ao_spatial.m"
+
+// The parts of mpv the driver calls.
+static atomic_int wakeups;
+static int reloads;
+void mp_msg(struct mp_log *log, int lev, const char *format, ...) {}
+void ao_wakeup(struct ao *ao) { atomic_fetch_add(&wakeups, 1); }
+void ao_request_reload(struct ao *ao) { reloads++; }
+const m_option_type_t m_option_type_int64;
+
+struct fake_sink {
+    mpv_spatial_audio_sink sink;
+    bool refuse, ready, failed;
+    mpv_spatial_audio_codec codec;
+    AVSampleBufferRenderSynchronizer *synchronizer;
+    int begins, closes;
+    int64_t begin_time;
+    NSMutableData *received;
+};
+
+static bool sink_open(void *ctx, mpv_spatial_audio_codec codec, void *synchronizer)
+{
+    struct fake_sink *s = ctx;
+    s->codec = codec;
+    s->synchronizer = synchronizer;
+    return !s->refuse;
+}
+static void sink_begin(void *ctx, int64_t time)
+{
+    struct fake_sink *s = ctx;
+    s->begins++;
+    s->begin_time = time;
+    [s->received setLength:0];
+}
+static void sink_write(void *ctx, const void *data, size_t size)
+{
+    [((struct fake_sink *)ctx)->received appendBytes:data length:size];
+}
+static bool sink_is_ready(void *ctx) { return ((struct fake_sink *)ctx)->ready; }
+static bool sink_has_failed(void *ctx) { return ((struct fake_sink *)ctx)->failed; }
+static void sink_close(void *ctx) { ((struct fake_sink *)ctx)->closes++; }
+
+static int failures;
+#define CHECK(cond, ...) do { \
+    if (!(cond)) { failures++; printf("FAIL %s:%d: ", __FILE__, __LINE__); printf(__VA_ARGS__); printf("\n"); } \
+} while (0)
+
+static struct fake_sink *new_sink(void)
+{
+    struct fake_sink *s = calloc(1, sizeof(*s));
+    s->sink = (mpv_spatial_audio_sink){
+        .version = MPV_SPATIAL_AUDIO_SINK_VERSION, .ctx = s,
+        .open = sink_open, .begin = sink_begin, .write = sink_write,
+        .is_ready = sink_is_ready, .has_failed = sink_has_failed, .close = sink_close,
+    };
+    s->received = [[NSMutableData alloc] init];
+    return s;
+}
+
+// TrueHD passthrough as ad_spdif sets it up: 192 kHz, 8 channels of 16 bits.
+static struct ao *new_ao(struct fake_sink *s, int format)
+{
+    struct ao *ao = calloc(1, sizeof(*ao));
+    struct priv *p = calloc(1, sizeof(*p));
+    p->sink_address = s ? (int64_t)(intptr_t)&s->sink : 0;
+    ao->priv = p;
+    ao->format = format;
+    ao->samplerate = 192000;
+    ao->sstride = 16;
+    return ao;
+}
+
+static struct mp_pcm_state state_of(struct ao *ao)
+{
+    struct mp_pcm_state state = {0};
+    get_state(ao, &state);
+    return state;
+}
+
+// One MAT burst lasts 20 ms: 3840 samples at 192 kHz.
+static void write_burst(struct ao *ao, uint8_t fill)
+{
+    uint8_t burst[3840 * 16];
+    memset(burst, fill, sizeof(burst));
+    void *planes[] = {burst};
+    audio_write(ao, planes, 3840);
+}
+
+int main(void)
+{
+    @autoreleasepool {
+        // Without a sink, or for PCM, the output refuses, so mpv uses the next one.
+        struct ao *none = new_ao(NULL, AF_FORMAT_S_TRUEHD);
+        CHECK(init(none) < 0, "init without a sink must fail");
+
+        struct fake_sink *s = new_sink();
+        struct ao *pcm = new_ao(s, AF_FORMAT_S16);
+        CHECK(init(pcm) < 0, "init for PCM must fail");
+        CHECK(s->codec == 0, "open must not be called for PCM");
+
+        s->refuse = true;
+        struct ao *refused = new_ao(s, AF_FORMAT_S_TRUEHD);
+        CHECK(init(refused) < 0, "init must fail when the host refuses");
+        CHECK(s->codec == MPV_SPATIAL_AUDIO_CODEC_TRUEHD, "open gets the codec");
+        s->refuse = false;
+
+        struct ao *dts = new_ao(s, AF_FORMAT_S_DTSHD);
+        CHECK(init(dts) == 0 && s->codec == MPV_SPATIAL_AUDIO_CODEC_DTSHD, "DTS-HD opens as DTS-HD");
+        uninit(dts);
+
+        // TrueHD: opened with the synchronizer the clock runs on, at rate 0.
+        struct ao *ao = new_ao(s, AF_FORMAT_S_TRUEHD);
+        struct priv *p = ao->priv;
+        s->begins = 0;
+        CHECK(init(ao) == 0, "init for TrueHD succeeds");
+        CHECK(s->synchronizer == p->synchronizer && s->synchronizer != nil, "open gets the synchronizer");
+        CHECK(s->begins == 1, "init begins a timeline");
+        CHECK(ao->device_buffer == 192000 * 3, "mpv may queue 3 s");
+        CHECK(p->synchronizer.rate == 0, "the clock waits at rate 0");
+
+        // Bursts reach the host unchanged, before and after start().
+        write_burst(ao, 0x5a);
+        start(ao);
+        for (int n = 0; n < 9; n++)
+            write_burst(ao, (uint8_t)n);
+        CHECK(s->received.length == 10 * 3840 * 16, "every byte reaches the host (%lu)", (unsigned long)s->received.length);
+        CHECK(((const uint8_t *)s->received.bytes)[0] == 0x5a, "bytes arrive unchanged");
+
+        // While the host is not ready, the clock holds and everything counts as queued.
+        struct mp_pcm_state st = state_of(ao);
+        CHECK(st.playing, "reports playing while the clock waits, or mpv sees an underrun");
+        CHECK(fabs(st.delay - 0.2) < 0.001, "delay is all written audio while waiting (%f)", st.delay);
+        CHECK(st.free_samples == 192000 * 3 - 38400, "free space is the rest (%d)", st.free_samples);
+        int before = atomic_load(&wakeups);
+        usleep(60 * 1000);
+        CHECK(fabs(state_of(ao).delay - 0.2) < 0.001, "the clock does not move while waiting");
+        CHECK(atomic_load(&wakeups) - before >= 3, "the ao thread is nudged while waiting (%d)", atomic_load(&wakeups) - before);
+
+        // Once ready, the clock runs from the timeline's start.
+        s->ready = true;
+        st = state_of(ao);
+        CHECK(p->synchronizer.rate == 1, "the clock starts when the host is ready");
+        usleep(100 * 1000);
+        double delay = state_of(ao).delay;
+        CHECK(delay > 0.07 && delay < 0.13, "delay falls in real time (%f)", delay);
+        before = atomic_load(&wakeups);
+        usleep(40 * 1000);
+        CHECK(atomic_load(&wakeups) == before, "no nudging once the clock runs");
+
+        // Pause stops the clock, resume restarts it.
+        set_pause(ao, true);
+        CHECK(p->synchronizer.rate == 0, "pause stops the clock");
+        delay = state_of(ao).delay;
+        usleep(50 * 1000);
+        CHECK(fabs(state_of(ao).delay - delay) < 0.002, "the clock holds while paused");
+        set_pause(ao, false);
+        CHECK(p->synchronizer.rate == 1, "resume restarts the clock");
+
+        // Playing out everything ends the stream: mpv reads that as EOF.
+        usleep(150 * 1000);
+        st = state_of(ao);
+        CHECK(!st.playing && st.delay == 0, "all audio played ends playback (%f)", st.delay);
+
+        // A seek begins a new timeline at the current time and waits for the host again.
+        int begins = s->begins;
+        s->ready = false;
+        reset(ao);
+        CHECK(s->begins == begins + 1 && s->received.length == 0, "reset begins a new timeline");
+        CHECK(p->synchronizer.rate == 0 && !p->clock_running, "reset stops the clock");
+        CHECK(s->begin_time == ns_from_time(CMTimebaseGetTime(p->synchronizer.timebase)), "the timeline starts at the clock's time");
+        write_burst(ao, 1);
+        start(ao);
+        CHECK(fabs(state_of(ao).delay - 0.02) < 0.001, "delay restarts from the new timeline");
+
+        // A host failure asks mpv to reopen the output, once.
+        s->failed = true;
+        state_of(ao);
+        state_of(ao);
+        CHECK(reloads == 1, "a failure requests one reload (%d)", reloads);
+
+        uninit(ao);
+        CHECK(s->closes == 2, "uninit closes the sink (%d)", s->closes);
+        before = atomic_load(&wakeups);
+        usleep(30 * 1000);
+        CHECK(atomic_load(&wakeups) == before, "no wakeups after uninit");
+    }
+    printf(failures ? "%d FAILED\n" : "all passed\n", failures);
+    return failures ? 1 : 0;
+}
