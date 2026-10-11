@@ -57,7 +57,9 @@ jobs:
       - name: Check that passthrough is built
         run: |
           for lib in dist/MPVKit-combined/xcframework/MPVKit.xcframework/*/MPVKit.framework/MPVKit; do
-            nm "$lib" | grep -q ff_spdif_muxer || { echo "no spdif muxer in $lib"; exit 1; }
+            # grep -c reads to the end, so nm never writes into a closed pipe
+            # (grep -q would, and pipefail would then fail a good build).
+            [ "$(nm "$lib" | grep -c ff_spdif_muxer || true)" -gt 0 ] || { echo "no spdif muxer in $lib"; exit 1; }
           done
 
       - name: Upload binary to GitHub Release
