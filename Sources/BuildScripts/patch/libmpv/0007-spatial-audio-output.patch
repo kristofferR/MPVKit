@@ -381,10 +381,10 @@ index 85fa777..7b64ea3 100644
      // ao_device_list_add() to add entries. The selected device will be set as
 diff --git a/include/mpv/spatial_audio.h b/include/mpv/spatial_audio.h
 new file mode 100644
-index 0000000..cd870f2
+index 0000000..9b80af5
 --- /dev/null
 +++ b/include/mpv/spatial_audio.h
-@@ -0,0 +1,101 @@
+@@ -0,0 +1,102 @@
 +/* Copyright (C) 2026 the mpv developers
 + *
 + * Permission to use, copy, modify, and/or distribute this software for any
@@ -435,8 +435,9 @@ index 0000000..cd870f2
 +} mpv_spatial_audio_codec;
 +
 +/**
-+ * Callbacks from the output. They are never called concurrently. Times are on
-+ * the synchronizer's clock, in nanoseconds.
++ * Callbacks from the output. They are never called concurrently, except
++ * set_volume, which mpv calls from its core thread. Times are on the
++ * synchronizer's clock, in nanoseconds.
 + */
 +typedef struct mpv_spatial_audio_sink {
 +    /** MPV_SPATIAL_AUDIO_SINK_VERSION. */
