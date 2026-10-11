@@ -22,10 +22,10 @@ index 4e5e9e3..3cacf38 100644
      &audio_out_lavc,
 diff --git a/audio/out/ao_spatial.m b/audio/out/ao_spatial.m
 new file mode 100644
-index 0000000..29a6756
+index 0000000..c42dd22
 --- /dev/null
 +++ b/audio/out/ao_spatial.m
-@@ -0,0 +1,275 @@
+@@ -0,0 +1,309 @@
 +/*
 + * This file is part of mpv.
 + *
@@ -46,6 +46,11 @@ index 0000000..29a6756
 +// Hands TrueHD and DTS-HD passthrough to the host application, which renders
 +// it itself (see include/mpv/spatial_audio.h), and keeps mpv's audio clock on
 +// the AVSampleBufferRenderSynchronizer the host renders into.
++//
++// A stream the host fails on falls back to PCM the way avfoundation's
++// compressed sink does: the format is latched and the output reloaded, the
++// reopen refuses it, and mpv decodes the track instead. A later PCM
++// initialization clears the latch, so the next track or file tries again.
 +
 +#include <stdatomic.h>
 +
@@ -79,7 +84,17 @@ index 0000000..29a6756
 +    // The host has finished this timeline; the next write begins another.
 +    bool ended;
 +    bool reload_requested;
++    // mpv's software volume last handed to the host. It never reaches a
++    // bitstream, so the host applies it.
++    float gain;
 +};
++
++static _Atomic bool spatial_format_latch[2];
++
++static int spatial_latch_index(int format)
++{
++    return format == AF_FORMAT_S_DTSHD;
++}
 +
 +static int64_t ns_from_time(CMTime time)
 +{
@@ -141,7 +156,16 @@ index 0000000..29a6756
 +    } else if (ao->format == AF_FORMAT_S_DTSHD) {
 +        codec = MPV_SPATIAL_AUDIO_CODEC_DTSHD;
 +    } else {
++        if (!af_fmt_is_spdif(ao->format)) {
++            atomic_store(&spatial_format_latch[0], false);
++            atomic_store(&spatial_format_latch[1], false);
++        }
 +        MP_VERBOSE(ao, "only TrueHD and DTS-HD passthrough are handed to the host\n");
++        return -1;
++    }
++    if (atomic_load(&spatial_format_latch[spatial_latch_index(ao->format)])) {
++        MP_INFO(ao, "%s failed in the host; decoding it instead\n",
++                af_fmt_to_str(ao->format));
 +        return -1;
 +    }
 +
@@ -152,6 +176,9 @@ index 0000000..29a6756
 +        p->synchronizer = nil;
 +        return -1;
 +    }
++
++    p->gain = atomic_load(&ao->gain);
++    p->sink->set_volume(p->sink->ctx, p->gain);
 +
 +    // The host's encoder holds 1.5 s before its first output, so let mpv
 +    // queue well beyond that.
@@ -248,9 +275,16 @@ index 0000000..29a6756
 +    struct priv *p = ao->priv;
 +
 +    if (p->sink->has_failed(p->sink->ctx) && !p->reload_requested) {
-+        MP_WARN(ao, "the host failed to render the stream, reopening\n");
++        MP_WARN(ao, "the host failed to render the stream, falling back to PCM\n");
 +        p->reload_requested = true;
++        atomic_store(&spatial_format_latch[spatial_latch_index(ao->format)], true);
 +        ao_request_reload(ao);
++    }
++
++    float gain = atomic_load(&ao->gain);
++    if (gain != p->gain) {
++        p->gain = gain;
++        p->sink->set_volume(p->sink->ctx, gain);
 +    }
 +
 +    if (p->playing && !p->paused && !p->clock_running &&
@@ -334,10 +368,10 @@ index 85fa777..fd91647 100644
      // ao_device_list_add() to add entries. The selected device will be set as
 diff --git a/include/mpv/spatial_audio.h b/include/mpv/spatial_audio.h
 new file mode 100644
-index 0000000..6900a97
+index 0000000..cd870f2
 --- /dev/null
 +++ b/include/mpv/spatial_audio.h
-@@ -0,0 +1,90 @@
+@@ -0,0 +1,101 @@
 +/* Copyright (C) 2026 the mpv developers
 + *
 + * Permission to use, copy, modify, and/or distribute this software for any
@@ -369,7 +403,8 @@ index 0000000..6900a97
 + * application, which renders it itself, for example as Apple spatial audio
 + * through an AVSampleBufferAudioRenderer. Apple platforms only.
 + *
-+ * Use it with --audio-spdif=truehd,dts-hd and --ao=spatial,<pcm output>, and
++ * Use it with --audio-spdif=truehd,dts-hd and --ao=spatial,<pcm output> (or
++ * --ao=spatial, to autoprobe the rest), and
 + * pass the address of a filled-in mpv_spatial_audio_sink, which must outlive
 + * the player, as the int64 option --ao-spatial-sink. The output refuses every
 + * other format, so PCM goes to the next output in the list.
@@ -379,7 +414,7 @@ index 0000000..6900a97
 + * true, then runs it from the timeline's start, so video waits for the host.
 + */
 +
-+#define MPV_SPATIAL_AUDIO_SINK_VERSION 1
++#define MPV_SPATIAL_AUDIO_SINK_VERSION 2
 +
 +typedef enum mpv_spatial_audio_codec {
 +    MPV_SPATIAL_AUDIO_CODEC_TRUEHD = 1,
@@ -411,7 +446,9 @@ index 0000000..6900a97
 +    bool (*is_ready)(void *ctx);
 +    /**
 +     * Whether the host failed, for example on a stream it cannot render. The
-+     * output then asks mpv to reopen it; refuse in open() to fall back to PCM.
++     * output then reopens without the host for that codec, so mpv decodes the
++     * track to PCM. Once that PCM output has opened, the next track or audio
++     * reinitialization offers the codec to the host again.
 +     */
 +    bool (*has_failed)(void *ctx);
 +    /** Releases what open() prepared. */
@@ -421,6 +458,14 @@ index 0000000..6900a97
 +     * written, including what a startup buffer holds back, and become ready.
 +     */
 +    void (*end)(void *ctx);
++    /**
++     * mpv's software volume as a linear gain: --volume, --volume-gain,
++     * replaygain and --mute together, 0 when muted. mpv cannot scale a
++     * bitstream, so the host applies it to what it renders. Called after
++     * open() and whenever it changes; above 1 is amplification the host may
++     * clamp.
++     */
++    void (*set_volume)(void *ctx, float volume);
 +} mpv_spatial_audio_sink;
 +
 +#ifdef __cplusplus

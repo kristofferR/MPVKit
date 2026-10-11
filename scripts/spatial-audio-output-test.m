@@ -20,6 +20,8 @@ static int reloads;
 void mp_msg(struct mp_log *log, int lev, const char *format, ...) {}
 void ao_wakeup(struct ao *ao) { atomic_fetch_add(&wakeups, 1); }
 void ao_request_reload(struct ao *ao) { reloads++; }
+bool af_fmt_is_spdif(int format) { return format >= AF_FORMAT_S_AAC && format < AF_FORMAT_COUNT; }
+const char *af_fmt_to_str(int format) { return "spdif"; }
 const m_option_type_t m_option_type_int64;
 
 struct fake_sink {
@@ -28,6 +30,8 @@ struct fake_sink {
     mpv_spatial_audio_codec codec;
     AVSampleBufferRenderSynchronizer *synchronizer;
     int begins, closes, ends;
+    int volumes;
+    float volume;
     int64_t begin_time;
     NSMutableData *received;
 };
@@ -53,6 +57,12 @@ static void sink_write(void *ctx, const void *data, size_t size)
 static bool sink_is_ready(void *ctx) { return ((struct fake_sink *)ctx)->ready; }
 static bool sink_has_failed(void *ctx) { return ((struct fake_sink *)ctx)->failed; }
 static void sink_close(void *ctx) { ((struct fake_sink *)ctx)->closes++; }
+static void sink_set_volume(void *ctx, float volume)
+{
+    struct fake_sink *s = ctx;
+    s->volumes++;
+    s->volume = volume;
+}
 // The real host flushes its renderer here, then reports ready.
 static void sink_end(void *ctx)
 {
@@ -73,7 +83,7 @@ static struct fake_sink *new_sink(void)
         .version = MPV_SPATIAL_AUDIO_SINK_VERSION, .ctx = s,
         .open = sink_open, .begin = sink_begin, .write = sink_write,
         .is_ready = sink_is_ready, .has_failed = sink_has_failed, .close = sink_close,
-        .end = sink_end,
+        .end = sink_end, .set_volume = sink_set_volume,
     };
     s->received = [[NSMutableData alloc] init];
     return s;
@@ -89,6 +99,7 @@ static struct ao *new_ao(struct fake_sink *s, int format)
     ao->format = format;
     ao->samplerate = 192000;
     ao->sstride = 16;
+    atomic_store(&ao->gain, 1.0f); // as ao_alloc sets it
     return ao;
 }
 
@@ -124,6 +135,7 @@ int main(void)
         struct ao *refused = new_ao(s, AF_FORMAT_S_TRUEHD);
         CHECK(init(refused) < 0, "init must fail when the host refuses");
         CHECK(s->codec == MPV_SPATIAL_AUDIO_CODEC_TRUEHD, "open gets the codec");
+        CHECK(s->volumes == 0, "a refused stream gets no volume");
         s->refuse = false;
 
         struct ao *dts = new_ao(s, AF_FORMAT_S_DTSHD);
@@ -134,11 +146,22 @@ int main(void)
         struct ao *ao = new_ao(s, AF_FORMAT_S_TRUEHD);
         struct priv *p = ao->priv;
         s->begins = 0;
+        s->volumes = 0;
         CHECK(init(ao) == 0, "init for TrueHD succeeds");
         CHECK(s->synchronizer == p->synchronizer && s->synchronizer != nil, "open gets the synchronizer");
         CHECK(s->begins == 1, "init begins a timeline");
         CHECK(ao->device_buffer == 192000 * 3, "mpv may queue 3 s");
         CHECK(p->synchronizer.rate == 0, "the clock waits at rate 0");
+
+        // mpv cannot scale a bitstream, so its volume and mute go to the host.
+        CHECK(s->volumes == 1 && s->volume == 1.0f, "open hands the host mpv's volume");
+        atomic_store(&ao->gain, 0.0f);
+        state_of(ao);
+        CHECK(s->volumes == 2 && s->volume == 0.0f, "a change reaches the host, mute as 0");
+        state_of(ao);
+        CHECK(s->volumes == 2, "an unchanged volume is not sent again");
+        atomic_store(&ao->gain, 1.0f);
+        state_of(ao);
 
         // Bursts reach the host unchanged, before and after start().
         write_burst(ao, 0x5a);
@@ -250,6 +273,30 @@ int main(void)
         before = atomic_load(&wakeups);
         usleep(30 * 1000);
         CHECK(atomic_load(&wakeups) == before, "no wakeups after uninit");
+
+        // The reopen refuses the failed format without asking the host, so
+        // mpv falls back to decoding it.
+        s->failed = false;
+        s->codec = 0;
+        struct ao *reopened = new_ao(s, AF_FORMAT_S_TRUEHD);
+        CHECK(init(reopened) < 0, "the reopen after a failure refuses TrueHD");
+        CHECK(s->codec == 0, "and does not offer it to the host");
+        struct ao *other = new_ao(s, AF_FORMAT_S_DTSHD);
+        CHECK(init(other) == 0, "DTS-HD is not latched by a TrueHD failure");
+        uninit(other);
+        struct ao *ac3 = new_ao(s, AF_FORMAT_S_AC3);
+        CHECK(init(ac3) < 0, "AC-3 goes to the next output");
+        s->codec = 0;
+        CHECK(init(new_ao(s, AF_FORMAT_S_TRUEHD)) < 0, "another passthrough format leaves the latch");
+        CHECK(s->codec == 0, "and the host still is not asked");
+
+        // Once the decoded track opens a PCM output, the next track tries the
+        // host again.
+        CHECK(init(new_ao(s, AF_FORMAT_FLOAT)) < 0, "PCM goes to the next output");
+        struct ao *retried = new_ao(s, AF_FORMAT_S_TRUEHD);
+        CHECK(init(retried) == 0 && s->codec == MPV_SPATIAL_AUDIO_CODEC_TRUEHD,
+              "a PCM initialization clears the latch");
+        uninit(retried);
     }
     printf(failures ? "%d FAILED\n" : "all passed\n", failures);
     return failures ? 1 : 0;
