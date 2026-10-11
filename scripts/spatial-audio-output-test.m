@@ -205,9 +205,10 @@ int main(void)
         CHECK(s->begins == begins + 1 && s->received.length == 0, "reset begins a new timeline");
         CHECK(p->synchronizer.rate == 0 && !p->clock_running, "reset stops the clock");
         CHECK(s->begin_time == ns_from_time(CMTimebaseGetTime(p->synchronizer.timebase)), "the timeline starts at the clock's time");
-        write_burst(ao, 1);
+        for (int i = 0; i < 3; i++)
+            write_burst(ao, 1);
         start(ao);
-        CHECK(fabs(state_of(ao).delay - 0.02) < 0.001, "delay restarts from the new timeline");
+        CHECK(fabs(state_of(ao).delay - 0.06) < 0.001, "delay restarts from the new timeline");
 
         // At the end the host lets go of what it holds back, so audio shorter
         // than its startup buffer still plays.
@@ -216,8 +217,13 @@ int main(void)
         state_of(ao);
         CHECK(p->clock_running && p->synchronizer.rate == 1, "the clock starts once the host has flushed");
         CHECK(state_of(ao).free_samples == 0, "the next file waits until this one has played out");
+        set_pause(ao, true);
+        state_of(ao);
+        CHECK(!atomic_load(&p->waiting), "no nudging while paused at the end, as nothing plays out");
+        set_pause(ao, false);
+        CHECK(state_of(ao).delay > 0 && atomic_load(&p->waiting), "nudging resumes with playback");
         int nudged = atomic_load(&wakeups);
-        usleep(40 * 1000);
+        usleep(100 * 1000);
         CHECK(atomic_load(&wakeups) > nudged, "the ao thread is nudged until the ended timeline has played out");
         state_of(ao);
         CHECK(!atomic_load(&p->waiting), "and no longer once it has");
