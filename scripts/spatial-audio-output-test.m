@@ -27,7 +27,7 @@ struct fake_sink {
     bool refuse, ready, failed;
     mpv_spatial_audio_codec codec;
     AVSampleBufferRenderSynchronizer *synchronizer;
-    int begins, closes;
+    int begins, closes, ends;
     int64_t begin_time;
     NSMutableData *received;
 };
@@ -53,6 +53,13 @@ static void sink_write(void *ctx, const void *data, size_t size)
 static bool sink_is_ready(void *ctx) { return ((struct fake_sink *)ctx)->ready; }
 static bool sink_has_failed(void *ctx) { return ((struct fake_sink *)ctx)->failed; }
 static void sink_close(void *ctx) { ((struct fake_sink *)ctx)->closes++; }
+// The real host flushes its renderer here, then reports ready.
+static void sink_end(void *ctx)
+{
+    struct fake_sink *s = ctx;
+    s->ends++;
+    s->ready = true;
+}
 
 static int failures;
 #define CHECK(cond, ...) do { \
@@ -66,6 +73,7 @@ static struct fake_sink *new_sink(void)
         .version = MPV_SPATIAL_AUDIO_SINK_VERSION, .ctx = s,
         .open = sink_open, .begin = sink_begin, .write = sink_write,
         .is_ready = sink_is_ready, .has_failed = sink_has_failed, .close = sink_close,
+        .end = sink_end,
     };
     s->received = [[NSMutableData alloc] init];
     return s;
@@ -199,7 +207,15 @@ int main(void)
         start(ao);
         CHECK(fabs(state_of(ao).delay - 0.02) < 0.001, "delay restarts from the new timeline");
 
+        // At the end the host lets go of what it holds back, so audio shorter
+        // than its startup buffer still plays.
+        end_of_stream(ao);
+        CHECK(s->ends == 1, "the host hears the end");
+        state_of(ao);
+        CHECK(p->clock_running && p->synchronizer.rate == 1, "the clock starts once the host has flushed");
+
         // A long run stays representable: 14 h at 192 kHz overflows written * 1e9.
+        reset(ao);
         CMTime now = CMTimebaseGetTime(p->synchronizer.timebase);
         p->timeline = CMTimeSubtract(now, CMTimeMake(14 * 3600, 1));
         p->written = INT64_C(192000) * 14 * 3600 + 19200; // and 0.1 s still to play

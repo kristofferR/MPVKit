@@ -22,10 +22,10 @@ index 4e5e9e3..3cacf38 100644
      &audio_out_lavc,
 diff --git a/audio/out/ao_spatial.m b/audio/out/ao_spatial.m
 new file mode 100644
-index 0000000..8765ace
+index 0000000..248377d
 --- /dev/null
 +++ b/audio/out/ao_spatial.m
-@@ -0,0 +1,245 @@
+@@ -0,0 +1,255 @@
 +/*
 + * This file is part of mpv.
 + *
@@ -224,6 +224,15 @@ index 0000000..8765ace
 +    return true;
 +}
 +
++// The host holds back the start of a stream, and its encoder the latest
++// audio, until it has more; at the end it has to let both go.
++static void end_of_stream(struct ao *ao)
++{
++    struct priv *p = ao->priv;
++
++    p->sink->end(p->sink->ctx);
++}
++
 +static void get_state(struct ao *ao, struct mp_pcm_state *state)
 +{
 +    struct priv *p = ao->priv;
@@ -264,6 +273,7 @@ index 0000000..8765ace
 +    .set_pause   = set_pause,
 +    .write       = audio_write,
 +    .get_state   = get_state,
++    .end_of_stream = end_of_stream,
 +    .priv_size   = sizeof(struct priv),
 +    .options     = (const struct m_option[]) {
 +        {"sink", OPT_INT64(sink_address)},
@@ -271,12 +281,43 @@ index 0000000..8765ace
 +    },
 +    .options_prefix = "ao-spatial",
 +};
+diff --git a/audio/out/buffer.c b/audio/out/buffer.c
+index 277b524..a7e38f9 100644
+--- a/audio/out/buffer.c
++++ b/audio/out/buffer.c
+@@ -685,8 +685,11 @@ static bool ao_play_data(struct ao *ao)
+     MP_TRACE(ao, "in=%d space=%d(%d) pl=%d, eof=%d\n",
+              samples, space, state.free_samples, p->playing, got_eof);
+ 
+-    if (got_eof)
++    if (got_eof) {
++        if (ao->driver->end_of_stream)
++            ao->driver->end_of_stream(ao);
+         goto eof;
++    }
+ 
+     return samples > 0 && (samples < space || ao->untimed);
+ 
+diff --git a/audio/out/internal.h b/audio/out/internal.h
+index 85fa777..fd91647 100644
+--- a/audio/out/internal.h
++++ b/audio/out/internal.h
+@@ -173,6 +173,9 @@ struct ao_driver {
+     bool (*write)(struct ao *ao, void **data, int samples);
+     // push based: return mandatory stream information
+     void (*get_state)(struct ao *ao, struct mp_pcm_state *state);
++    // push based, optional: the audio has ended, and nothing more is written
++    // until reset(). For drivers that hold audio back until they get more.
++    void (*end_of_stream)(struct ao *ao);
+ 
+     // Return the list of devices currently available in the system. Use
+     // ao_device_list_add() to add entries. The selected device will be set as
 diff --git a/include/mpv/spatial_audio.h b/include/mpv/spatial_audio.h
 new file mode 100644
-index 0000000..4c82928
+index 0000000..6900a97
 --- /dev/null
 +++ b/include/mpv/spatial_audio.h
-@@ -0,0 +1,85 @@
+@@ -0,0 +1,90 @@
 +/* Copyright (C) 2026 the mpv developers
 + *
 + * Permission to use, copy, modify, and/or distribute this software for any
@@ -355,6 +396,11 @@ index 0000000..4c82928
 +    bool (*has_failed)(void *ctx);
 +    /** Releases what open() prepared. */
 +    void (*close)(void *ctx);
++    /**
++     * Nothing more is written until the next begin(): render everything
++     * written, including what a startup buffer holds back, and become ready.
++     */
++    void (*end)(void *ctx);
 +} mpv_spatial_audio_sink;
 +
 +#ifdef __cplusplus
