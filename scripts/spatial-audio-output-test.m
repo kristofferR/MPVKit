@@ -99,7 +99,9 @@ static struct ao *new_ao(struct fake_sink *s, int format)
     ao->format = format;
     ao->samplerate = 192000;
     ao->sstride = 16;
-    atomic_store(&ao->gain, 1.0f); // as ao_alloc sets it
+    // As ao_alloc() does: ao_set_gain() reaches the driver before init().
+    atomic_store(&ao->gain, 1.0f);
+    audio_out_spatial.set_gain(ao, 1.0f);
     return ao;
 }
 
@@ -127,6 +129,10 @@ int main(void)
         CHECK(init(none) < 0, "init without a sink must fail");
 
         struct fake_sink *s = new_sink();
+        // ao_alloc() sets the gain before init(); nothing is open to tell.
+        struct ao *unopened = new_ao(s, AF_FORMAT_S_TRUEHD);
+        audio_out_spatial.set_gain(unopened, 1.0f);
+        CHECK(s->volumes == 0, "a gain set before init() reaches no host");
         struct ao *pcm = new_ao(s, AF_FORMAT_S16);
         CHECK(init(pcm) < 0, "init for PCM must fail");
         CHECK(s->codec == 0, "open must not be called for PCM");
