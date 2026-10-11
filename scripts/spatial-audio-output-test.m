@@ -216,7 +216,11 @@ int main(void)
         state_of(ao);
         CHECK(p->clock_running && p->synchronizer.rate == 1, "the clock starts once the host has flushed");
         CHECK(state_of(ao).free_samples == 0, "the next file waits until this one has played out");
+        int nudged = atomic_load(&wakeups);
         usleep(40 * 1000);
+        CHECK(atomic_load(&wakeups) > nudged, "the ao thread is nudged until the ended timeline has played out");
+        state_of(ao);
+        CHECK(!atomic_load(&p->waiting), "and no longer once it has");
         begins = s->begins;
         write_burst(ao, 3);
         CHECK(s->begins == begins + 1 && !p->ended, "the next file begins a new timeline");

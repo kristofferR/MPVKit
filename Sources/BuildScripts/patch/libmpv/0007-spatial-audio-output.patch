@@ -22,10 +22,10 @@ index 4e5e9e3..3cacf38 100644
      &audio_out_lavc,
 diff --git a/audio/out/ao_spatial.m b/audio/out/ao_spatial.m
 new file mode 100644
-index 0000000..feb1e2f
+index 0000000..ebb9375
 --- /dev/null
 +++ b/audio/out/ao_spatial.m
-@@ -0,0 +1,268 @@
+@@ -0,0 +1,274 @@
 +/*
 + * This file is part of mpv.
 + *
@@ -93,7 +93,7 @@ index 0000000..feb1e2f
 +
 +    atomic_store(&p->waiting, waiting);
 +    dispatch_source_set_timer(p->wakeup_timer,
-+        waiting ? DISPATCH_TIME_NOW : DISPATCH_TIME_FOREVER,
++        waiting ? dispatch_time(DISPATCH_TIME_NOW, 10 * NSEC_PER_MSEC) : DISPATCH_TIME_FOREVER,
 +        10 * NSEC_PER_MSEC, NSEC_PER_MSEC);
 +}
 +
@@ -262,6 +262,12 @@ index 0000000..feb1e2f
 +    }
 +
 +    int64_t queued = queued_ns(ao);
++
++    // After the end mpv writes nothing until this timeline has played out, and
++    // its thread would sleep a quarter of the buffer before noticing, holding
++    // up EOF and a gapless next file.
++    if (p->ended && atomic_load(&p->waiting) != (queued > 0))
++        set_waiting(ao, queued > 0);
 +
 +    state->queued_samples = queued * ao->samplerate / INT64_C(1000000000);
 +    int period = ao->samplerate / 100;
