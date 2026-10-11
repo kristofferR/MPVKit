@@ -22,10 +22,10 @@ index 4e5e9e3..3cacf38 100644
      &audio_out_lavc,
 diff --git a/audio/out/ao_spatial.m b/audio/out/ao_spatial.m
 new file mode 100644
-index 0000000..1b5b3f7
+index 0000000..8765ace
 --- /dev/null
 +++ b/audio/out/ao_spatial.m
-@@ -0,0 +1,221 @@
+@@ -0,0 +1,245 @@
 +/*
 + * This file is part of mpv.
 + *
@@ -84,6 +84,30 @@ index 0000000..1b5b3f7
 +    return CMTimeConvertScale(time, 1000000000, kCMTimeRoundingMethod_Default).value;
 +}
 +
++// Arms the timer that nudges the ao thread only while the clock waits.
++static void set_waiting(struct ao *ao, bool waiting)
++{
++    struct priv *p = ao->priv;
++
++    atomic_store(&p->waiting, waiting);
++    dispatch_source_set_timer(p->wakeup_timer,
++        waiting ? DISPATCH_TIME_NOW : DISPATCH_TIME_FOREVER,
++        10 * NSEC_PER_MSEC, NSEC_PER_MSEC);
++}
++
++// Audio written but not yet played. While the clock waits, that is all of it,
++// so mpv's audio position, and with it the video, waits too.
++static int64_t queued_ns(struct ao *ao)
++{
++    struct priv *p = ao->priv;
++
++    // Split so that days of 192 kHz audio stay within int64.
++    int64_t written = p->written / ao->samplerate * INT64_C(1000000000) +
++                      p->written % ao->samplerate * INT64_C(1000000000) / ao->samplerate;
++    int64_t now = ns_from_time(CMTimebaseGetTime(p->synchronizer.timebase));
++    return MPMAX(ns_from_time(p->timeline) + written - now, 0);
++}
++
 +static void begin_timeline(struct ao *ao)
 +{
 +    struct priv *p = ao->priv;
@@ -94,7 +118,7 @@ index 0000000..1b5b3f7
 +    p->playing = false;
 +    p->paused = false;
 +    p->clock_running = false;
-+    atomic_store(&p->waiting, false);
++    set_waiting(ao, false);
 +    p->sink->begin(p->sink->ctx, ns_from_time(p->timeline));
 +}
 +
@@ -132,8 +156,7 @@ index 0000000..1b5b3f7
 +
 +    p->queue = dispatch_queue_create("mpv spatial audio", DISPATCH_QUEUE_SERIAL);
 +    p->wakeup_timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, p->queue);
-+    dispatch_source_set_timer(p->wakeup_timer, DISPATCH_TIME_NOW,
-+                              10 * NSEC_PER_MSEC, NSEC_PER_MSEC);
++    dispatch_source_set_timer(p->wakeup_timer, DISPATCH_TIME_FOREVER, 0, 0);
 +    dispatch_source_set_event_handler(p->wakeup_timer, ^{
 +        if (atomic_load(&p->waiting))
 +            ao_wakeup(ao);
@@ -172,7 +195,7 @@ index 0000000..1b5b3f7
 +    struct priv *p = ao->priv;
 +
 +    p->playing = true;
-+    atomic_store(&p->waiting, !p->paused);
++    set_waiting(ao, !p->paused && !p->clock_running);
 +}
 +
 +static bool set_pause(struct ao *ao, bool paused)
@@ -182,7 +205,7 @@ index 0000000..1b5b3f7
 +    p->paused = paused;
 +    if (p->clock_running)
 +        [p->synchronizer setRate:paused ? 0 : 1];
-+    atomic_store(&p->waiting, p->playing && !paused && !p->clock_running);
++    set_waiting(ao, p->playing && !paused && !p->clock_running);
 +    return true;
 +}
 +
@@ -190,6 +213,12 @@ index 0000000..1b5b3f7
 +{
 +    struct priv *p = ao->priv;
 +
++    // After an underrun the clock has run past everything written; continuing
++    // that timeline would place new audio in the past.
++    if (p->clock_running && queued_ns(ao) == 0) {
++        MP_VERBOSE(ao, "restarting the timeline after an underrun\n");
++        begin_timeline(ao);
++    }
 +    p->sink->write(p->sink->ctx, data[0], (size_t)samples * ao->sstride);
 +    p->written += samples;
 +    return true;
@@ -210,15 +239,10 @@ index 0000000..1b5b3f7
 +    {
 +        [p->synchronizer setRate:1 time:p->timeline];
 +        p->clock_running = true;
-+        atomic_store(&p->waiting, false);
++        set_waiting(ao, false);
 +    }
 +
-+    // While the clock waits, everything written counts as queued, so mpv's
-+    // audio position, and with it the video, waits too.
-+    int64_t now = ns_from_time(CMTimebaseGetTime(p->synchronizer.timebase));
-+    int64_t end = ns_from_time(p->timeline) +
-+                  p->written * INT64_C(1000000000) / ao->samplerate;
-+    int64_t queued = MPMAX(end - now, 0);
++    int64_t queued = queued_ns(ao);
 +
 +    state->queued_samples = queued * ao->samplerate / INT64_C(1000000000);
 +    int period = ao->samplerate / 100;

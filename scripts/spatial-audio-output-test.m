@@ -180,9 +180,17 @@ int main(void)
         st = state_of(ao);
         CHECK(!st.playing && st.delay == 0, "all audio played ends playback (%f)", st.delay);
 
-        // A seek begins a new timeline at the current time and waits for the host again.
+        // Audio after an underrun would land in the past on the old timeline,
+        // so it starts a new one, which waits for the host again.
         int begins = s->begins;
         s->ready = false;
+        write_burst(ao, 2);
+        CHECK(s->begins == begins + 1, "a write after an underrun begins a new timeline");
+        CHECK(!p->clock_running && p->synchronizer.rate == 0, "the new timeline waits for the host");
+        CHECK(fabs(state_of(ao).delay - 0.02) < 0.001, "only the new audio is queued");
+
+        // A seek begins a new timeline at the current time and waits for the host again.
+        begins = s->begins;
         reset(ao);
         CHECK(s->begins == begins + 1 && s->received.length == 0, "reset begins a new timeline");
         CHECK(p->synchronizer.rate == 0 && !p->clock_running, "reset stops the clock");
@@ -190,6 +198,12 @@ int main(void)
         write_burst(ao, 1);
         start(ao);
         CHECK(fabs(state_of(ao).delay - 0.02) < 0.001, "delay restarts from the new timeline");
+
+        // A long run stays representable: 14 h at 192 kHz overflows written * 1e9.
+        CMTime now = CMTimebaseGetTime(p->synchronizer.timebase);
+        p->timeline = CMTimeSubtract(now, CMTimeMake(14 * 3600, 1));
+        p->written = INT64_C(192000) * 14 * 3600 + 19200; // and 0.1 s still to play
+        CHECK(fabs(state_of(ao).delay - 0.1) < 0.001, "a 14 h timeline keeps its delay (%f)", state_of(ao).delay);
 
         // A host failure asks mpv to reopen the output, once.
         s->failed = true;
